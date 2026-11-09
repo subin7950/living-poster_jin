@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>살아있는 포스터 · WebAR</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000;
+    font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+    -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  #container { position: fixed; inset: 0; }
+  #start { position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 12px; padding: 24px; text-align: center;
+    color: #fff; background: #111; }
+  #start h1 { margin: 0; font-size: 24px; }
+  #start p { margin: 0; color: #bbb; font-size: 15px; line-height: 1.5; }
+  #start button { margin-top: 8px; padding: 14px 32px; font-size: 17px; font-weight: 700;
+    color: #111; background: #ffd84d; border: 0; border-radius: 999px; }
+  #hud { position: fixed; left: 12px; top: 12px; z-index: 5; padding: 8px 12px;
+    color: #fff; background: rgba(0,0,0,.55); border-radius: 10px;
+    font-size: 13px; line-height: 1.6; white-space: pre; pointer-events: none; }
+  #hud[hidden] { display: none; }
+  #toast { position: fixed; left: 50%; bottom: 40px; z-index: 6; transform: translateX(-50%);
+    padding: 10px 18px; color: #111; background: #ffd84d; border-radius: 999px;
+    font-size: 15px; font-weight: 700; opacity: 0; transition: opacity .25s; pointer-events: none; }
+  #toast.show { opacity: 1; }
+  .ripple { position: fixed; z-index: 7; width: 16px; height: 16px; margin: -8px 0 0 -8px;
+    border: 3px solid #ffd84d; border-radius: 50%; pointer-events: none;
+    animation: ripple .45s ease-out forwards; }
+  @keyframes ripple { to { transform: scale(4); opacity: 0; } }
+</style>
+
+<!-- three.js 0.160 고정: MindAR 1.2.5가 이 버전대 API를 사용함 -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+    "mindar-image-three": "https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-three.prod.js"
+  }
+}
+</script>
+</head>
+<body>
+<div id="container"></div>
+
+<div id="start">
+  <h1>살아있는 포스터</h1>
+  <p>포스터를 비추면 영상이 재생돼요.<br>영상이나 캐릭터를 손가락으로 눌러 보세요.</p>
+  <button id="startBtn">AR 시작</button>
+</div>
+<div id="hud" hidden></div>
+<div id="toast"></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { MindARThree } from 'mindar-image-three';
+
+// ───────────────────────────────────────────────
+// 설정 — 수업에서는 이 부분만 바꾼다
+// ───────────────────────────────────────────────
+// 크기 단위는 "카드 가로폭" (1 = 카드 한 장 폭)
+const CONFIG = {
+  targetSrc: './targets.mind',   // MindAR 컴파일러로 만든 파일. 이미지 순서 = index
+
+  targets: [
+    // 영상 포스터: 비추면 재생, 놓치면 일시정지
+    //   tap: 'sound' → 누르면 소리 켜기/끄기   'pause' → 누르면 재생/정지
+    { index: 0, name: '포스터', video: './posterA.mp4', tap: 'sound' },
+
+    // 캐릭터 카드: 누르면 인사 동작 + 효과음
+    //   model이 없거나 경로가 틀리면 color의 기본 도형이 나온다
+    //   sound가 null이면 "뾰롱" 하는 기본 효과음을 코드로 만들어 낸다
+    { index: 1, name: '캐릭터', model: './modelA.glb', color: 0x8ec5ff, sound: null },
+  ],
+
+  videoWidth: 1.0,      // 영상 판 폭 = 카드 폭 × 이 값. 영상 비율은 자동으로 맞춤
+  modelHeight: 0.6,     // 캐릭터 키 = 카드 폭의 0.6배 (모델 원래 크기와 무관하게 자동 맞춤)
+  modelYawOffset: 0,    // 모델이 엉뚱한 방향을 보면 Math.PI 또는 Math.PI/2
+  tapPadding: 1.3,      // 캐릭터 터치 영역을 실제보다 1.3배 넉넉하게 (손가락이 굵으니까)
+
+  idleClip: 'Idle',     // GLB 애니메이션 이름 (10-1과 동일)
+  greetClip: 'Greet',   // 누르면 재생. 없으면 통통 튀는 동작으로 대체
+
+  // 트래킹 안정화 (10-1과 동일)
+  filterMinCF: 0.0001,
+  filterBeta: 0.001,
+  missTolerance: 10,
+  warmupTolerance: 3,
+};
+
+// ───────────────────────────────────────────────
+// MindAR 준비
+// ───────────────────────────────────────────────
+const container = document.querySelector('#container');
+const mindarThree = new MindARThree({
+  container,
+  imageTargetSrc: CONFIG.targetSrc,
+  maxTrack: CONFIG.targets.length,
+  filterMinCF: CONFIG.filterMinCF,
+  filterBeta: CONFIG.filterBeta,
+  missTolerance: CONFIG.missTolerance,
+  warmupTolerance: CONFIG.warmupTolerance,
+});
+const { renderer, scene, camera } = mindarThree;
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x777777, 2.2));
+const sun = new THREE.DirectionalLight(0xffffff, 1.5);
+sun.position.set(0.5, 1, 1);
+scene.add(sun);
+
+const loader = new GLTFLoader();
+const hud = document.querySelector('#hud');
+const toastEl = document.querySelector('#toast');
+const tappables = [];   // 터치로 맞출 수 있는 물체 목록: { obj, target, kind }
+
+// ───────────────────────────────────────────────
+// 타깃 하나 = 앵커 + (영상 또는 캐릭터)
+// ───────────────────────────────────────────────
+function makeTarget(cfg) {
+  const t = { cfg, anchor: mindarThree.addAnchor(cfg.index), visible: false,
+              video: null, hop: null, hopTime: -1, mixer: null, actions: {}, idle: null, fallback: false };
+
+  t.anchor.onTargetFound = () => {
+    t.visible = true;
+    console.log(`[AR] ${cfg.name} 인식`);
+    if (t.video) playVideo(t.video);
+  };
+  t.anchor.onTargetLost = () => {
+    t.visible = false;
+    console.log(`[AR] ${cfg.name} 놓침`);
+    if (t.video) t.video.pause();
+  };
+
+  if (cfg.video) makeVideo(t);
+  if (cfg.model !== undefined) makeCharacter(t);
+  return t;
+}
+
+// ── 영상 판: 카드 면 위에 영상을 텍스처로 붙인 사각형
+function makeVideo(t) {
+  const v = document.createElement('video');
+  v.src = t.cfg.video;
+  v.loop = true;
+  v.muted = true;                 // 처음엔 무음이어야 자동 재생이 허용된다 (iPhone 정책)
+  v.playsInline = true;           // iPhone에서 전체화면으로 튀어나가지 않게
+  v.setAttribute('playsinline', '');
+  v.setAttribute('webkit-playsinline', '');
+  v.crossOrigin = 'anonymous';
+  v.preload = 'auto';
+  t.video = v;
+
+  const tex = new THREE.VideoTexture(v);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const plane = new THREE.Mesh(
+    new THREE.PlaneGeometry(1, 1),
+    new THREE.MeshBasicMaterial({ map: tex, toneMapped: false }));
+  plane.scale.set(CONFIG.videoWidth, CONFIG.videoWidth, 1);
+  plane.position.z = 0.002;       // 카드 면에서 아주 살짝 띄움 (깜빡임 방지)
+  v.addEventListener('loadedmetadata', () => {
+    plane.scale.y = CONFIG.videoWidth * (v.videoHeight / v.videoWidth);   // 영상 비율 그대로
+  });
+  t.anchor.group.add(plane);
+  tappables.push({ obj: plane, target: t, kind: 'video' });
+}
+
+function playVideo(v) {
+  v.play().catch(() => {
+    // 소리 켠 상태에서 재생이 막히면 무음으로 바꿔 다시 시도
+    v.muted = true;
+    v.play().catch(() => {});
+  });
+}
+
+// ── 캐릭터: 10-1과 같은 방식으로 카드 위에 세운다
+function makeCharacter(t) {
+  const stand = new THREE.Group();
+  stand.rotation.x = Math.PI / 2;           // 카드 면(XY)에서 +Z 방향으로 세우기
+  stand.rotation.order = 'XYZ';
+  t.anchor.group.add(stand);
+  const yaw = new THREE.Group();
+  yaw.rotation.y = CONFIG.modelYawOffset;
+  t.hop = new THREE.Group();
+  stand.add(yaw);
+  yaw.add(t.hop);
+  loadModel(t);
+}
+
+async function loadModel(t) {
+  let obj;
+  try {
+    const gltf = await loader.loadAsync(t.cfg.model);
+    obj = gltf.scene;
+    if (gltf.animations.length) {
+      t.mixer = new THREE.AnimationMixer(obj);
+      gltf.animations.forEach(c => t.actions[c.name] = t.mixer.clipAction(c));
+      const idleClip = gltf.animations.find(c => c.name === CONFIG.idleClip)
+                    || gltf.animations.find(c => c.name !== CONFIG.greetClip);
+      t.idle = idleClip ? t.mixer.clipAction(idleClip) : null;
+      t.idle?.play();
+    }
+  } catch (e) {
+    console.warn(`[AR] ${t.cfg.model} 로드 실패 → 기본 도형 사용`);
+    t.fallback = true;
+    obj = makeFallback(t.cfg.color ?? 0x8ec5ff);
+  }
+  fitHeight(obj, CONFIG.modelHeight);
+
+  // 터치 영역: 모델을 감싸는 보이지 않는 상자 (모델 모양이 복잡해도 잘 눌리게)
+  // 크기는 카드에 붙이기 전에 잰다 (붙인 뒤에 재면 카드의 배율까지 섞인다)
+  const size = new THREE.Box3().setFromObject(obj).getSize(new THREE.Vector3()).multiplyScalar(CONFIG.tapPadding);
+  t.hop.add(obj);
+  const hitBox = new THREE.Mesh(new THREE.BoxGeometry(size.x, size.y, size.z),
+                                new THREE.MeshBasicMaterial({ visible: false }));
+  hitBox.position.y = size.y / CONFIG.tapPadding / 2;
+  t.hop.add(hitBox);
+  tappables.push({ obj: hitBox, target: t, kind: 'character' });
+}
+
+function fitHeight(obj, height) {
+  obj.updateMatrixWorld(true);
+  const size = new THREE.Box3().setFromObject(obj).getSize(new THREE.Vector3());
+  obj.scale.multiplyScalar(height / (size.y || 1));
+  obj.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(obj);
+  const center = box.getCenter(new THREE.Vector3());
+  obj.position.x -= center.x;
+  obj.position.z -= center.z;
+  obj.position.y -= box.min.y;
+}
+
+function makeFallback(color) {
+  const g = new THREE.Group();
+  const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.3, 0.35, 8, 24),
+                              new THREE.MeshStandardMaterial({ color, roughness: 0.6 }));
+  body.position.y = 0.475;
+  g.add(body);
+  const eyeMat = new THREE.MeshStandardMaterial({ color: 0x222222 });
+  for (const x of [-0.1, 0.1]) {
+    const eye = new THREE.Mesh(new THREE.SphereGeometry(0.045, 16, 12), eyeMat);
+    eye.position.set(x, 0.62, 0.28);
+    g.add(eye);
+  }
+  return g;
+}
+
+const targets = CONFIG.targets.map(makeTarget);
+
+// ───────────────────────────────────────────────
+// 터치: 화면을 누른 곳에서 카메라 방향으로 광선(ray)을 쏴서 맞은 물체를 찾는다
+// ───────────────────────────────────────────────
+const raycaster = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+let started = false;
+
+window.addEventListener('pointerup', e => {
+  if (!started) return;
+  showRipple(e.clientX, e.clientY);
+
+  // 화면 좌표 → -1 ~ 1 범위의 좌표 (three.js가 쓰는 방식)
+  const rect = container.getBoundingClientRect();
+  ndc.set(((e.clientX - rect.left) / rect.width) * 2 - 1,
+          -((e.clientY - rect.top) / rect.height) * 2 + 1);
+  raycaster.setFromCamera(ndc, camera);
+
+  // 지금 보이는 카드의 물체만 검사 (안 보이는 카드는 맞으면 안 됨)
+  const live = tappables.filter(x => x.target.visible);
+  const hits = raycaster.intersectObjects(live.map(x => x.obj), false);
+  if (!hits.length) return;
+
+  // 영상 판 위에 캐릭터가 서 있으면 캐릭터가 먼저 맞는다 (가장 가까운 것)
+  const hit = live.find(x => x.obj === hits[0].object);
+  onTap(hit);
+});
+
+function onTap({ target: t, kind }) {
+  console.log(`[AR] 터치: ${t.cfg.name}`);
+  if (kind === 'video') {
+    const v = t.video;
+    if (t.cfg.tap === 'pause') {
+      if (v.paused) { playVideo(v); toast('▶ 재생'); } else { v.pause(); toast('⏸ 일시정지'); }
+    } else {
+      v.muted = !v.muted;
+      if (v.paused) playVideo(v);
+      toast(v.muted ? '🔇 소리 끔' : '🔊 소리 켬');
+    }
+  } else {
+    greet(t);
+    playSound(t.cfg.sound);
+  }
+}
+
+function greet(t) {
+  const act = t.actions[CONFIG.greetClip];
+  if (act && t.mixer) {
+    t.idle?.fadeOut(0.2);
+    act.reset().setLoop(THREE.LoopOnce, 1).fadeIn(0.2).play();
+    const back = e => {
+      if (e.action !== act) return;
+      t.mixer.removeEventListener('finished', back);
+      act.fadeOut(0.2);
+      t.idle?.reset().fadeIn(0.2).play();
+    };
+    t.mixer.addEventListener('finished', back);
+  } else {
+    t.hopTime = 0;
+  }
+}
+
+// ───────────────────────────────────────────────
+// 소리: 파일이 있으면 재생, 없으면 코드로 "뾰롱" 소리를 만든다
+// ───────────────────────────────────────────────
+let audioCtx = null;
+const sounds = {};
+
+async function loadSounds() {
+  for (const cfg of CONFIG.targets) {
+    if (!cfg.sound || cfg.sound in sounds) continue;
+    try {
+      const res = await fetch(cfg.sound);
+      if (!res.ok) throw new Error(res.status);
+      sounds[cfg.sound] = await audioCtx.decodeAudioData(await res.arrayBuffer());
+    } catch (e) {
+      console.warn(`[AR] ${cfg.sound} 로드 실패 → 기본 효과음 사용`);
+      sounds[cfg.sound] = null;
+    }
+  }
+}
+
+function playSound(url) {
+  if (!audioCtx) return;
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  const buf = url ? sounds[url] : null;
+  if (buf) {
+    const src = audioCtx.createBufferSource();
+    src.buffer = buf;
+    src.connect(audioCtx.destination);
+    src.start();
+    return;
+  }
+  const now = audioCtx.currentTime;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(660, now);
+  osc.frequency.exponentialRampToValueAtTime(1320, now + 0.09);
+  gain.gain.setValueAtTime(0.25, now);
+  gain.gain.exponentialRampToValueAtTime(0.001, now + 0.25);
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start(now);
+  osc.stop(now + 0.25);
+}
+
+// ───────────────────────────────────────────────
+// 화면 피드백
+// ───────────────────────────────────────────────
+function showRipple(x, y) {
+  const d = document.createElement('div');
+  d.className = 'ripple';
+  d.style.left = x + 'px';
+  d.style.top = y + 'px';
+  document.body.appendChild(d);
+  setTimeout(() => d.remove(), 500);
+}
+
+let toastTimer;
+function toast(msg) {
+  toastEl.textContent = msg;
+  toastEl.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove('show'), 1200);
+}
+
+// ───────────────────────────────────────────────
+// 매 프레임
+// ───────────────────────────────────────────────
+const clock = new THREE.Clock();
+let hudTimer = 0;
+
+function update(dt) {
+  for (const t of targets) {
+    t.mixer?.update(dt);
+    if (t.hopTime >= 0) {
+      t.hopTime += dt;
+      const dur = 0.4;
+      if (t.hopTime >= dur * 2) { t.hopTime = -1; t.hop.position.y = 0; }
+      else t.hop.position.y = Math.abs(Math.sin(t.hopTime / dur * Math.PI)) * CONFIG.modelHeight * 0.25;
+    }
+  }
+
+  hudTimer += dt;
+  if (hudTimer > 0.15) {
+    hudTimer = 0;
+    hud.textContent = targets.map(t => {
+      let line = `${t.cfg.name}  ${t.visible ? '● 인식' : '○ 찾는 중'}`;
+      if (t.video && t.visible) line += t.video.muted ? '  🔇 탭하면 소리' : '  🔊';
+      if (t.fallback) line += ' (기본 도형)';
+      return line;
+    }).join('\n');
+  }
+}
+
+// ───────────────────────────────────────────────
+// 시작 — 버튼 누르는 순간이 "사용자 동작"이라 소리·영상 권한을 여기서 얻는다
+// ───────────────────────────────────────────────
+document.querySelector('#startBtn').addEventListener('click', async () => {
+  document.querySelector('#start').remove();
+
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  audioCtx.resume();
+  for (const t of targets) {
+    if (t.video) t.video.play().then(() => t.video.pause()).catch(() => {});   // iPhone 영상 재생 권한 미리 받기
+  }
+
+  try {
+    await mindarThree.start();
+    started = true;
+    hud.hidden = false;
+    loadSounds();
+    renderer.setAnimationLoop(() => {
+      update(Math.min(clock.getDelta(), 0.1));
+      renderer.render(scene, camera);
+    });
+  } catch (e) {
+    console.error(e);
+    hud.hidden = false;
+    hud.textContent = '카메라를 켤 수 없어요.\n· 주소가 https:// 인지 확인\n· 브라우저 카메라 권한 허용\n· targets.mind 파일 경로 확인';
+  }
+});
+</script>
+</body>
+</html>
